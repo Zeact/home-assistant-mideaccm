@@ -12,49 +12,83 @@ climate:
 import logging
 import json
 import voluptuous as vol
+import asyncio
+import async_timeout
 
-from homeassistant.components.climate import (ClimateDevice, PLATFORM_SCHEMA)
+from homeassistant.components.climate import ClimateEntity, PLATFORM_SCHEMA
 from homeassistant.components.climate.const import (
-    ATTR_HVAC_MODE, HVAC_MODE_COOL, HVAC_MODE_DRY, HVAC_MODE_FAN_ONLY,
-    HVAC_MODE_HEAT, SUPPORT_FAN_MODE, HVAC_MODE_AUTO, HVAC_MODE_OFF,
-    SUPPORT_TARGET_TEMPERATURE)
-from homeassistant.const import (CONF_NAME, CONF_HOST, CONF_PORT,
-                                 TEMP_CELSIUS, ATTR_TEMPERATURE)
+    ATTR_HVAC_MODE, 
+    HVACMode,
+    FAN_AUTO,
+    FAN_LOW,
+    FAN_MEDIUM,
+    FAN_HIGH,
+    FAN_OFF,
+    ClimateEntityFeature,
+)
+from homeassistant.const import (
+    CONF_NAME, 
+    CONF_HOST, 
+    CONF_PORT,
+    UnitOfTemperature,
+    ATTR_TEMPERATURE,
+)
 import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 import xmltodict
-import requests
-REQUIREMENTS = ['xmltodict==0.11.0']
 
 DOMAIN = 'ccm15'
 _LOGGER = logging.getLogger(__name__)
-
 DEFAULT_NAME = 'Midea Thermostat'
 DEFAULT_TIMEOUT = 5
 BASE_URL = 'http://{0}:{1}{2}'
 CONF_URL_STATUS = '/status.xml'
 CONF_URL_CTRL = '/ctrl.xml'
-
 ATTR_MODE = 'mode'
-CONST_MODE_FAN_AUTO = 'auto'
-CONST_MODE_FAN_LOW = 'low'
-CONST_MODE_FAN_MIDDLE = 'middle'
-CONST_MODE_FAN_HIGH = 'high'
-CONST_MODE_FAN_OFF = 'off'
 
-CONST_STATE_CMD_MAP = {HVAC_MODE_COOL:0, HVAC_MODE_HEAT:1, HVAC_MODE_DRY:2, HVAC_MODE_FAN_ONLY:3, HVAC_MODE_OFF:4, HVAC_MODE_AUTO:5}
+# Define fan modes
+CONST_MODE_FAN_AUTO = FAN_AUTO
+CONST_MODE_FAN_LOW = FAN_LOW
+CONST_MODE_FAN_MIDDLE = FAN_MEDIUM
+CONST_MODE_FAN_HIGH = FAN_HIGH
+CONST_MODE_FAN_OFF = FAN_OFF
+
+# State to command mapping
+CONST_STATE_CMD_MAP = {
+    HVACMode.COOL: 0,
+    HVACMode.HEAT: 1,
+    HVACMode.DRY: 2,
+    HVACMode.FAN_ONLY: 3,
+    HVACMode.OFF: 4,
+    HVACMode.AUTO: 5
+}
 CONST_CMD_STATE_MAP = {v: k for k, v in CONST_STATE_CMD_MAP.items()}
-CONST_FAN_CMD_MAP = {CONST_MODE_FAN_AUTO:0, CONST_MODE_FAN_LOW:2, CONST_MODE_FAN_MIDDLE:3, CONST_MODE_FAN_HIGH:4, CONST_MODE_FAN_OFF:5}
+
+# Fan mode to command mapping
+CONST_FAN_CMD_MAP = {
+    CONST_MODE_FAN_AUTO: 0,
+    CONST_MODE_FAN_LOW: 2,
+    CONST_MODE_FAN_MIDDLE: 3,
+    CONST_MODE_FAN_HIGH: 4,
+    CONST_MODE_FAN_OFF: 5
+}
 CONST_CMD_FAN_MAP = {v: k for k, v in CONST_FAN_CMD_MAP.items()}
 
-SUPPORT_HVAC = [HVAC_MODE_COOL, HVAC_MODE_HEAT, HVAC_MODE_DRY, HVAC_MODE_FAN_ONLY, HVAC_MODE_OFF, HVAC_MODE_AUTO]
+# Supported HVAC modes
+SUPPORT_HVAC = [
+    HVACMode.COOL,
+    HVACMode.HEAT,
+    HVACMode.DRY,
+    HVACMode.FAN_ONLY,
+    HVACMode.OFF,
+    HVACMode.AUTO
+]
 
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
     vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
     vol.Optional(CONF_HOST, default='192.168.1.200'): cv.string,
     vol.Optional(CONF_PORT, default=80): cv.positive_int,
 })
-
-SUPPORT_FLAGS = (SUPPORT_TARGET_TEMPERATURE | SUPPORT_FAN_MODE)
 
 # parse data from ccm bytes
 def get_status_from(s):
@@ -72,37 +106,35 @@ def get_status_from(s):
     temp = 0
     err = 0
     settemp = 0
-
     if s == '-':
-        return None;
+        return None
+    
     bytesarr = bytes.fromhex(s.strip(','))
-
     buf = bytesarr[0]
     is_degreeF = (buf >> 0) & 1
     ctl = (buf >> 3) & 0x1f
-
+    
     buf = bytesarr[1]
     htl = (buf >> 0) & 0x1f
     locked_wind = (buf >> 5) & 7
-
+    
     buf = bytesarr[2]
     locked_mode = (buf >> 0) & 3
     err = (buf >> 2) & 0x3f
-
     if locked_mode == 1:
         locked_mode = 0
     elif locked_mode == 2:
         locked_mode = 1
     else:
         locked_mode = -1
-
+    
     buf = bytesarr[3]
     mode = (buf >> 2) & 7
     fan = (buf >> 5) & 7
     buf = (buf >> 1) & 1
     if buf != 0:
         ml = 1
-
+    
     buf = bytesarr[4]
     settemp = (buf >> 3) & 0x1f
     DEGREE = "℃"
@@ -111,7 +143,7 @@ def get_status_from(s):
         ctl += 62
         htl += 62
         DEGREE = "℉"
-
+    
     buf = bytesarr[5]
     if ((buf >> 3) & 1) == 0:
         ctl = 0
@@ -120,10 +152,10 @@ def get_status_from(s):
     fl = 0 if ((buf >> 5) & 1) == 0 else 1
     if ((buf >> 6) & 1) != 0:
         rml = 1
-
+    
     buf = bytesarr[6]
     temp = buf if buf < 128 else buf - 256
-
+    
     ac = {}
     ac['ac_mode'] = mode
     ac['fan'] = fan
@@ -131,81 +163,89 @@ def get_status_from(s):
     ac['settemp'] = settemp
     ac['err'] = err
     ac['locked'] = 0
-    if ml == 1 or fl == 1 or ctl > 0 or htl > 0 or rml == 1:
+    if ml == 1 or fl == 1 or ctl > 0 or htl > 0 or rml == 1:  # 修复了语法错误
         ac['locked'] = 1
     ac['l_rm'] = rml
-
     ac['l_mode'] = 10 if ml == 0 else locked_mode
     ac['l_wind'] = 10 if fl == 0 else locked_wind
-
     ac['l_cool_temp'] = ctl
     ac['l_heat_temp'] = htl
-
     return ac
 
-# poll ac status
-def poll_status(host, port):
-    resource = BASE_URL.format(
-        host,
-        port,
-        CONF_URL_STATUS)
-    data = {}
+async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
+    """Set up the Midea thermostats."""
+    host = config.get(CONF_HOST)
+    port = config.get(CONF_PORT)
+    name = config.get(CONF_NAME)
+    
     try:
-        response = requests.get(resource, timeout=10)
-        doc = xmltodict.parse(response.text)
-        data = doc['response']
-    except requests.exceptions.MissingSchema:
-        _LOGGER.error("Missing resource or schema in configuration. "
-                      "Add http:// to your URL")
-        return None
-    except requests.exceptions.ConnectionError:
-        _LOGGER.error("No route to device at %s", resource)
-        return None
+        acs = await _async_poll_status(hass, host, port)
+        devices = []
+        
+        for ac_name, ac_state in acs.items():
+            devices.append(Thermostat(name, ac_name, host, port, ac_state))
+        
+        async_add_entities(devices)
+    except Exception as e:
+        _LOGGER.error(f"Failed to set up CCM15 climate: {e}")
 
-    acs = {}
-    for ac_name, ac_binary in data.items():
-        if len(ac_binary) > 1:
-            ac_state = get_status_from(ac_binary)
-            if ac_state:
-                acs[ac_name] = ac_state
+async def _async_poll_status(hass, host, port):
+    """Poll the AC status using non-blocking aiohttp client."""
+    resource = BASE_URL.format(host, port, CONF_URL_STATUS)
+    session = async_get_clientsession(hass)
+    
+    try:
+        async with async_timeout.timeout(10):
+            response = await session.get(resource)
+            text = await response.text()
+            doc = xmltodict.parse(text)
+            data = doc['response']
+            
+            acs = {}
+            for ac_name, ac_binary in data.items():
+                if len(ac_binary) > 1:
+                    ac_state = get_status_from(ac_binary)
+                    if ac_state:
+                        acs[ac_name] = ac_state
+            return acs
+    except asyncio.TimeoutError:
+        _LOGGER.error("Timeout while connecting to %s", resource)
+        return {}
+    except Exception as e:
+        _LOGGER.error("Error getting status from %s: %s", resource, e)
+        return {}
 
-    return acs
-
-# pylint: disable=unused-argument
-def setup_platform(hass, config, add_devices, discovery_info=None):
-    """Setup the Midea thermostats."""
-    acs = poll_status(config.get(CONF_HOST), config.get(CONF_PORT))
-    dev = []
-
-    for ac_name, ac_state in acs.items():
-        dev.append(Thermostat(config.get(CONF_NAME), ac_name, config.get(CONF_HOST),
-                            config.get(CONF_PORT), ac_state))
-    add_devices(dev)
-
-
-# pylint: disable=abstract-method
-# pylint: disable=too-many-instance-attributes
-class Thermostat(ClimateDevice):
+class Thermostat(ClimateEntity):
     """Representation of a Midea thermostat."""
 
     def __init__(self, name, ac_name, host, port, acdata):
         """Initialize the thermostat."""
-        self._name = '{}_{}'.format(name, ac_name)
+        self._name = f'{name}_{ac_name}'
+        self._acdata = ''
         self._ac_name = ac_name
         self._ac_id = 2 ** (int(ac_name.strip('a')))
         self._host = host
         self._port = port
-        self._hvac_list = SUPPORT_HVAC
-        self._fan_list = [CONST_MODE_FAN_OFF, CONST_MODE_FAN_AUTO, CONST_MODE_FAN_LOW, CONST_MODE_FAN_MIDDLE, CONST_MODE_FAN_HIGH]
+        self._current_temp = None
+        self._current_settemp = None
+        self._current_state = None
+        self._current_fan = None
         self._current_setfan = CONST_MODE_FAN_AUTO
+        self._hvac_list = SUPPORT_HVAC
+        self._fan_list = [
+            CONST_MODE_FAN_OFF,
+            CONST_MODE_FAN_AUTO,
+            CONST_MODE_FAN_LOW,
+            CONST_MODE_FAN_MIDDLE,
+            CONST_MODE_FAN_HIGH
+        ]
         self.updateWithAcdata(acdata)
         _LOGGER.debug("Init called")
-        self.update()
 
     @property
     def supported_features(self):
         """Return the list of supported features."""
-        return SUPPORT_FLAGS
+        return ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.FAN_MODE
 
     @property
     def should_poll(self):
@@ -222,33 +262,51 @@ class Thermostat(ClimateDevice):
         if self._current_fan != CONST_MODE_FAN_OFF:
             self._current_setfan = self._current_fan
 
-    def update(self):
+    async def async_update(self):
         """Update the data from the thermostat."""
-        acdata = poll_status(self._host, self._port)[self._ac_name]
-        self.updateWithAcdata(acdata)
-        _LOGGER.debug("Update called")
+        try:
+            acs = await _async_poll_status(self.hass, self._host, self._port)
+            if self._ac_name in acs:
+                acdata = acs[self._ac_name]
+                if self._acdata == acdata:
+                    return
+                self._acdata = acdata
+                self.updateWithAcdata(acdata)
+        except Exception as e:
+            _LOGGER.error(f"Error updating thermostat: {e}")
 
-    def setStates(self):
+    async def async_set_states(self):
         """Set new target states."""
         state_cmd = CONST_STATE_CMD_MAP[self._current_state]
         fan_cmd = CONST_FAN_CMD_MAP[self._current_fan]
-
         url = BASE_URL.format(
             self._host,
             self._port,
             CONF_URL_CTRL +
-            '?ac0=' + str(self._ac_id) +
-            '&ac1=0' +
-            '&mode=' + str(state_cmd) +
-            '&fan=' + str(fan_cmd) +
-            '&temp=' + str(self._current_settemp)
-            )
+            f'?ac0={self._ac_id}'
+            '&ac1=0'
+            f'&mode={state_cmd}'
+            f'&fan={fan_cmd}'
+            f'&temp={self._current_settemp}'
+        )
         _LOGGER.info("Set state=%s", url)
-        req = requests.get(url, timeout=DEFAULT_TIMEOUT)
-        if req.status_code != requests.codes.ok:
-            _LOGGER.exception("Error doing API request")
-        else:
-            _LOGGER.debug("API request ok %d", req.status_code)
+        
+        session = async_get_clientsession(self.hass)
+        try:
+            async with async_timeout.timeout(DEFAULT_TIMEOUT):
+                response = await session.get(url)
+                if response.status != 200:
+                    _LOGGER.error("Error with API request: %s", response.status)
+                else:
+                    _LOGGER.debug("API request ok %d", response.status)
+        except Exception as e:
+            _LOGGER.error(f"Failed to set states: {e}")
+
+    @property
+    def unique_id(self):
+        """Return the unique_id of the thermostat."""
+        from homeassistant.util import slugify
+        return 'ccm15' + slugify(self.name)
 
     @property
     def name(self):
@@ -256,7 +314,7 @@ class Thermostat(ClimateDevice):
         return self._name
 
     @property
-    def device_state_attributes(self):
+    def extra_state_attributes(self):
         """Return the device specific state attributes."""
         return {
             ATTR_MODE: self._current_state
@@ -265,7 +323,7 @@ class Thermostat(ClimateDevice):
     @property
     def temperature_unit(self):
         """Return the unit of measurement."""
-        return TEMP_CELSIUS
+        return UnitOfTemperature.CELSIUS
 
     @property
     def current_temperature(self):
@@ -277,7 +335,7 @@ class Thermostat(ClimateDevice):
         """Return the temperature we try to reach."""
         return self._current_settemp
 
-    def set_temperature(self, **kwargs):
+    async def async_set_temperature(self, **kwargs):
         """Set new target temperature."""
         import math
         temperature = kwargs.get(ATTR_TEMPERATURE)
@@ -285,24 +343,21 @@ class Thermostat(ClimateDevice):
             return
         else:
             self._current_settemp = int(math.ceil(temperature)) if temperature > self._current_settemp else int(math.floor(temperature))
-            self.setStates()
-            self.async_write_ha_state()
+            await self.async_set_states()
 
     @property
     def hvac_mode(self):
         """Return the current state of the thermostat."""
         return self._current_state
 
-    def set_hvac_mode(self, hvac_mode):
+    async def async_set_hvac_mode(self, hvac_mode):
         """Set hvac mode."""
         if hvac_mode not in CONST_STATE_CMD_MAP:
-            hvac_mode = HVAC_MODE_OFF
+            hvac_mode = HVACMode.OFF
         if self._current_state != hvac_mode and self._current_fan == CONST_MODE_FAN_OFF:
             self._current_fan = self._current_setfan
         self._current_state = hvac_mode
-        self.setStates()
-        self.async_write_ha_state()
-        return
+        await self.async_set_states()
 
     @property
     def hvac_modes(self):
@@ -314,26 +369,20 @@ class Thermostat(ClimateDevice):
         """Return the fan setting."""
         return self._current_fan
 
-    def set_fan_mode(self, fan):
+    async def async_set_fan_mode(self, fan):
         """Set new target fan mode."""
-        if self._current_state == HVAC_MODE_OFF:
+        if self._current_state == HVACMode.OFF:
             return
         if fan not in CONST_FAN_CMD_MAP:
             fan = CONST_MODE_FAN_AUTO
         if fan == CONST_MODE_FAN_OFF:
-            self._current_state = HVAC_MODE_OFF
-
+            self._current_state = HVACMode.OFF
         self._current_fan = fan
-
         if self._current_fan != CONST_MODE_FAN_OFF:
             self._current_setfan = self._current_fan
-
-        self.setStates()
-        self.async_write_ha_state()
-        return
+        await self.async_set_states()
 
     @property
     def fan_modes(self):
         """Return the list of available fan modes."""
         return self._fan_list
-
