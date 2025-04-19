@@ -1,10 +1,10 @@
 {
-    "domain": "ccm15",
-    "name": "ccm15",
-    "documentation": "https://github.com/houselabs/home-assistant-mideaccm",
-    "requirements": [
-      "xmltodict==0.11.0"
-    ],
-    "dependencies": [],
-    "codeowners": []
-  }
+  "domain": "ccm15",
+  "name": "Midea CCM15 Thermostat",
+  "documentation": "https://github.com/Zeact/home-assistant-mideaccm",
+  "dependencies": [],
+  "codeowners": ["@Zeact"],
+  "requirements": ["xmltodict>=0.11.0"],
+  "iot_class": "local_polling",
+  "version": "0.1.0"
+}
